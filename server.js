@@ -1,9 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const { Transform } = require('stream');
-const { WebSocketServer } = require('ws');
-const http = require('http');
 require('dotenv').config();
 
 const app = express();
@@ -24,97 +21,64 @@ Be friendly, professional, and concise. Keep responses short for voice conversat
 
 // ============ VOICE ROUTES ============
 
-app.post('/voice/incoming', (req, res) => {
+app.post('/voice/incoming', async (req, res) => {
   const from = req.body.From || 'unknown';
   console.log(`📞 Incoming call from: ${from}`);
   
-  // Start Twilio Media Stream for 2-way conversation
+  // Use enhanced TwiML with better handling
   const response = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host.replace(':3000','')}/stream" />
-  </Connect>
-  <Say voice="Polly.Joanna-Neural">Hello! Thank you for calling 360 Print Works. How can I help you today?</Say>
+  <Say voice="Polly.Joanna-Neural">Hello! Thank you for calling 360 Print Works, New Jersey's premier printing company. How can I help you today?</Say>
+  <Gather numDigits="1" action="/voice/menu" method="POST" timeout="8" speechTimeout="5">
+    <Say voice="Polly.Joanna-Neural">Tell me what you need help with, or press 1 to speak with a representative.</Say>
+  </Gather>
 </Response>`;
   
   res.type('text/xml');
   res.send(response);
 });
 
-// WebSocket for real-time audio streaming (Deepgram)
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/stream' });
-
-wss.on('connection', (ws) => {
-  console.log('🔗 WebSocket connected');
-  let deepgram = null;
-  let streamSid = null;
+app.post('/voice/menu', async (req, res) => {
+  const digit = req.body.Digits || '';
+  const speechResult = req.body.SpeechResult || '';
+  console.log(`🔢 DTMF: ${digit}, Speech: ${speechResult}`);
   
-  // Connect to Deepgram
-  const dgSocket = new WebSocket(
-    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1',
-    {
-      headers: {
-        'Authorization': `Token ${DEEPGRAM_API_KEY}`
-      }
-    }
-  );
+  let response = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>`;
   
-  dgSocket.on('open', () => {
-    console.log('✅ Connected to Deepgram');
-  });
-  
-  dgSocket.on('message', async (msg) => {
-    const data = JSON.parse(msg);
-    const transcript = data.channel?.alternatives[0]?.transcript;
+  // Handle speech input
+  if (speechResult && speechResult.length > 2) {
+    console.log(`🗣️ User said: ${speechResult}`);
     
-    if (transcript && transcript.length > 0) {
-      console.log(`🗣️ You said: ${transcript}`);
-      
-      // Get AI response
-      const reply = await getAIResponse(transcript);
-      console.log(`🤖 AI: ${reply}`);
-      
-      // Convert to speech using MiniMax TTS
-      const audioBase64 = await getTTS(reply);
-      
-      // Send audio back via Twilio Media Stream (would need proper implementation)
-      ws.send(JSON.stringify({
-        event: 'media',
-        media: {
-          payload: audioBase64
-        }
-      }));
+    // Get AI response
+    try {
+      const aiReply = await getAIResponse(speechResult);
+      response += `<Say voice="Polly.Joanna-Neural">${aiReply}</Say>`;
+    } catch (e) {
+      response += `<Say voice="Polly.Joanna-Neural">I can connect you to our team. Please hold.</Say>`;
     }
-  });
+  }
   
-  dgSocket.on('error', (err) => {
-    console.error('Deepgram error:', err);
-  });
+  // Handle digit input
+  if (digit === '1' || digit === '2' || digit === '3') {
+    response += `<Say voice="Polly.Joanna-Neural">Connecting you to our team now.</Say>`;
+    response += `<Dial timeout="30">${FORWARD_TO}</Dial>`;
+  } else if (speechResult) {
+    // After AI response, give options
+    response += `<Gather numDigits="1" action="/voice/menu" method="POST" timeout="8">
+      <Say voice="Polly.Joanna-Neural">Press 1 to speak with someone, or tell me more.</Say>
+    </Gather>`;
+  } else {
+    response += `<Say voice="Polly.Joanna-Neural">No problem. Press 1 to speak with our team.</Say>`;
+    response += `<Dial>${FORWARD_TO}</Dial>`;
+  }
   
-  // Forward audio to Deepgram
-  ws.on('message', (msg) => {
-    const data = JSON.parse(msg);
-    
-    if (data.event === 'media') {
-      const audio = Buffer.from(data.media.payload, 'base64');
-      dgSocket.send(audio);
-    } else if (data.event === 'start') {
-      streamSid = data.streamSid;
-      console.log('📻 Stream started:', streamSid);
-    } else if (data.event === 'stop') {
-      console.log('📻 Stream stopped');
-      dgSocket.close();
-    }
-  });
-  
-  ws.on('close', () => {
-    console.log('❌ WebSocket closed');
-    dgSocket.close();
-  });
+  response += `</Response>`;
+  res.type('text/xml');
+  res.send(response);
 });
 
-// ============ AI & TTS ============
+// ============ AI Chat ============
 
 async function getAIResponse(message) {
   try {
@@ -135,53 +99,17 @@ async function getAIResponse(message) {
       }
     );
     
-    return response.data.choices[0].message.content;
+    let reply = response.data.choices[0].message.content;
+    // Keep response short for voice
+    if (reply.length > 200) {
+      reply = reply.substring(0, 200);
+    }
+    return reply;
   } catch (error) {
     console.error('AI Error:', error.message);
-    return "I'm here to help! How can I assist you today?";
+    return "I'd be happy to help you. Press 1 to speak with our team.";
   }
 }
-
-async function getTTS(text) {
-  try {
-    // Using MiniMax TTS
-    const response = await axios.post(
-      'https://api.minimax.io/v1/t2a',
-      {
-        text: text,
-        voice_id: 'male-shaun-2',
-        model: 'speech-01-turbo'
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${MINIMAX_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        responseType: 'arraybuffer'
-      }
-    );
-    
-    return Buffer.from(response.data).toString('base64');
-  } catch (error) {
-    console.error('TTS Error:', error.message);
-    return null;
-  }
-}
-
-// ============ FALLBACK ROUTES ============
-
-app.post('/voice/menu', (req, res) => {
-  const digit = req.body.Digits || '';
-  let response = `<?xml version="1.0" encoding="UTF-8"?><Response>`;
-  
-  if (digit) {
-    response += `<Dial>${FORWARD_TO}</Dial>`;
-  }
-  
-  response += `</Response>`;
-  res.type('text/xml');
-  res.send(response);
-});
 
 app.post('/ai/chat', async (req, res) => {
   const { message } = req.body;
@@ -191,13 +119,18 @@ app.post('/ai/chat', async (req, res) => {
   res.json({ reply });
 });
 
+// ============ Status ============
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', type: '2-way voice with Deepgram' });
+  res.json({ status: 'ok', type: 'voice with speech recognition' });
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'MiniMax 2-Way Voice Agent', status: 'running' });
+  res.json({ 
+    service: 'MiniMax Voice Agent',
+    features: ['AI greeting', 'Speech recognition', 'Call forwarding']
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🎙️ 2-Way Voice Agent running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🎙️ Voice agent running on port ${PORT}`));
