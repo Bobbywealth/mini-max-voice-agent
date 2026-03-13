@@ -175,13 +175,15 @@ async function getAIResponse(message) {
 
 async function getTTS(text) {
   try {
-    // Use MiniMax TTS
+    // Use MiniMax TTS - optimized for low latency
     const response = await axios.post(
       'https://api.minimax.io/v1/t2a',
       {
         text: text,
-        voice_id: 'male-shaun-2',
-        model: 'speech-01-turbo'
+        voice_id: 'female-yujia',  // Different voice options: male-shaun-2, female-yujia, male-aigen
+        model: 'speech-01-turbo',
+        speed: 1.1,  // Slightly faster
+        vol: 1.0
       },
       {
         headers: {
