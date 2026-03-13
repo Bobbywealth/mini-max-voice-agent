@@ -96,9 +96,9 @@ app.post('/ai/chat', async (req, res) => {
     }
     
     const completion = await axios.post(
-      'https://api.minimax.chat/v1/text/chatcompletion_v2',
+      'https://api.minimax.io/v1/chat/completions',
       {
-        model: 'MiniMax-Text-01',
+        model: 'M2-her',
         messages: [
           { role: 'system', content: PERSONA },
           { role: 'user', content: message }
