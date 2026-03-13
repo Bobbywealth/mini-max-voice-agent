@@ -27,9 +27,10 @@ app.post('/voice/incoming', (req, res) => {
   const from = req.body.From || 'unknown';
   console.log(`📞 Call from: ${from}`);
   
-  // Connect to voice agent for 2-way conversation via Twilio Media Streams
+  // Connect to our WebSocket for 2-way audio
   const response = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="Polly.Joanna-Neural">Hello! Thank you for calling 360 Print Works. How may I help you today?</Say>
   <Connect>
     <Stream url="wss://mini-max-voice-agent.onrender.com/stream" />
   </Connect>
@@ -48,10 +49,8 @@ app.post('/voice/menu', async (req, res) => {
   
   if (digit === '1') {
     response += `<Dial>${FORWARD_TO}</Dial>`;
-  } else if (digit === '2') {
+  } else {
     response += `<Dial>${FORWARD_TO}</Dial>`;
-  } else if (digit === '3') {
-    response += `<Say>We're at 85 May Street, Irvington, New Jersey.</Say>`;
   }
   
   response += `</Response>`;
@@ -59,7 +58,7 @@ app.post('/voice/menu', async (req, res) => {
   res.send(response);
 });
 
-// ============ WEBSOCKET FOR REAL-TIME SPEECH (DEEPGRAM) ============
+// ============ WEBSOCKET FOR REAL-TIME AUDIO ============
 
 wss.on('connection', (ws) => {
   console.log('🔗 WebSocket connected');
@@ -67,7 +66,7 @@ wss.on('connection', (ws) => {
   let dgSocket = null;
   let streamSid = null;
   
-  // Connect to Deepgram
+  // Connect to Deepgram for speech-to-text
   try {
     dgSocket = new WebSocket(
       'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&interim_results=true',
@@ -79,53 +78,62 @@ wss.on('connection', (ws) => {
     );
     
     dgSocket.on('open', () => {
-      console.log('✅ Connected to Deepgram');
+      console.log('✅ Deepgram connected');
     });
     
     dgSocket.on('message', async (msg) => {
       const data = JSON.parse(msg);
       const transcript = data.channel?.alternatives[0]?.transcript;
       
-      if (transcript && data.is_final) {
+      if (transcript && data.is_final && transcript.length > 2) {
         console.log(`🗣️ Heard: ${transcript}`);
         
         // Get AI response
         const reply = await getAIResponse(transcript);
         console.log(`🤖 AI: ${reply}`);
         
-        // Convert to speech using MiniMax TTS
-        const audio = await getTTS(reply);
+        // Get TTS audio
+        const audioBase64 = await getTTS(reply);
         
-        if (audio) {
-          // Would send back via Twilio - simplified for now
-          console.log(`📢 Speaking: ${reply}`);
+        if (audioBase64) {
+          // Send audio back to Twilio
+          ws.send(JSON.stringify({
+            event: 'media',
+            media: {
+              payload: audioBase64
+            }
+          }));
+          console.log(`📢 Playing: ${reply}`);
         }
       }
     });
     
     dgSocket.on('error', (err) => {
-      console.error('Deepgram error:', err);
+      console.error('Deepgram error:', err.message);
     });
   } catch (err) {
-    console.error('Failed to connect to Deepgram:', err.message);
+    console.error('Failed to connect Deepgram:', err.message);
   }
   
-  // Handle Twilio media stream
+  // Forward Twilio audio to Deepgram
   ws.on('message', (msg) => {
-    const data = JSON.parse(msg);
-    
-    if (data.event === 'media') {
-      // Forward audio to Deepgram
-      if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+    try {
+      const data = JSON.parse(msg);
+      
+      if (data.event === 'media') {
         const audio = Buffer.from(data.media.payload, 'base64');
-        dgSocket.send(audio);
+        if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+          dgSocket.send(audio);
+        }
+      } else if (data.event === 'start') {
+        streamSid = data.streamSid;
+        console.log('📻 Stream started:', streamSid);
+      } else if (data.event === 'stop') {
+        console.log('📻 Stream stopped');
+        if (dgSocket) dgSocket.close();
       }
-    } else if (data.event === 'start') {
-      streamSid = data.streamSid;
-      console.log('📻 Stream started:', streamSid);
-    } else if (data.event === 'stop') {
-      console.log('📻 Stream stopped');
-      if (dgSocket) dgSocket.close();
+    } catch (e) {
+      console.error('WS message error:', e.message);
     }
   });
   
@@ -135,7 +143,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// ============ AI FUNCTIONS ============
+// ============ AI & TTS ============
 
 async function getAIResponse(message) {
   try {
@@ -161,14 +169,34 @@ async function getAIResponse(message) {
     return reply;
   } catch (error) {
     console.error('AI Error:', error.message);
-    return "I'd be happy to help. Can you tell me more?";
+    return "I'd be happy to help you with that.";
   }
 }
 
 async function getTTS(text) {
-  // MiniMax TTS would go here
-  // For now, returning null to use Twilio's TTS fallback
-  return null;
+  try {
+    // Use MiniMax TTS
+    const response = await axios.post(
+      'https://api.minimax.io/v1/t2a',
+      {
+        text: text,
+        voice_id: 'male-shaun-2',
+        model: 'speech-01-turbo'
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${MINIMAX_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+    
+    return Buffer.from(response.data).toString('base64');
+  } catch (error) {
+    console.error('TTS Error:', error.message);
+    return null;
+  }
 }
 
 // ============ STATUS ============
@@ -182,11 +210,11 @@ app.post('/ai/chat', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', type: '2-way with Deepgram' });
+  res.json({ status: 'ok', type: '2-way with Deepgram + MiniMax TTS' });
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'MiniMax + Deepgram Voice' });
+  res.json({ service: '2-Way Voice Agent' });
 });
 
 const PORT = process.env.PORT || 3000;
