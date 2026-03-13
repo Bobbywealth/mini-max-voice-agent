@@ -7,30 +7,23 @@ const app = express();
 app.use(bodyParser.json());
 
 const FORWARD_TO = process.env.FORWARD_TO || '+18089139158';
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 
-// MiniMax AI Persona
+// AI Persona
 const PERSONA = `You are a friendly receptionist for 360 Print Works, a printing company in New Jersey. 
-You help customers with:
-- Getting quotes for printing services (business cards, brochures, banners, etc)
-- Understanding services offered
-- Checking order status
-- Scheduling appointments
-Be friendly, professional, and concise. Keep responses short for voice conversation.`;
+Be brief and helpful.`;
 
 // ============ VOICE ROUTES ============
 
-app.post('/voice/incoming', async (req, res) => {
+app.post('/voice/incoming', (req, res) => {
   const from = req.body.From || 'unknown';
-  console.log(`📞 Incoming call from: ${from}`);
+  console.log(`📞 Call from: ${from}`);
   
-  // Use enhanced TwiML with better handling
   const response = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna-Neural">Hello! Thank you for calling 360 Print Works, New Jersey's premier printing company. How can I help you today?</Say>
-  <Gather numDigits="1" action="/voice/menu" method="POST" timeout="8" speechTimeout="5">
-    <Say voice="Polly.Joanna-Neural">Tell me what you need help with, or press 1 to speak with a representative.</Say>
+  <Say voice="Polly.Joanna-Neural">Thank you for calling 360 Print Works. How may I help you today?</Say>
+  <Gather numDigits="1" action="/voice/menu" method="POST" timeout="10">
+    <Say voice="Polly.Joanna-Neural">Press 1 for a free quote. Press 2 to check your order. Press 3 for our address. Or hold the line to speak with someone.</Say>
   </Gather>
 </Response>`;
   
@@ -40,37 +33,26 @@ app.post('/voice/incoming', async (req, res) => {
 
 app.post('/voice/menu', async (req, res) => {
   const digit = req.body.Digits || '';
-  const speechResult = req.body.SpeechResult || '';
-  console.log(`🔢 DTMF: ${digit}, Speech: ${speechResult}`);
+  console.log(`🔢 Pressed: ${digit}`);
   
   let response = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>`;
   
-  // Handle speech input
-  if (speechResult && speechResult.length > 2) {
-    console.log(`🗣️ User said: ${speechResult}`);
-    
-    // Get AI response
-    try {
-      const aiReply = await getAIResponse(speechResult);
-      response += `<Say voice="Polly.Joanna-Neural">${aiReply}</Say>`;
-    } catch (e) {
-      response += `<Say voice="Polly.Joanna-Neural">I can connect you to our team. Please hold.</Say>`;
-    }
-  }
-  
-  // Handle digit input
-  if (digit === '1' || digit === '2' || digit === '3') {
-    response += `<Say voice="Polly.Joanna-Neural">Connecting you to our team now.</Say>`;
-    response += `<Dial timeout="30">${FORWARD_TO}</Dial>`;
-  } else if (speechResult) {
-    // After AI response, give options
-    response += `<Gather numDigits="1" action="/voice/menu" method="POST" timeout="8">
-      <Say voice="Polly.Joanna-Neural">Press 1 to speak with someone, or tell me more.</Say>
+  if (digit === '1') {
+    response += `<Say voice="Polly.Joanna-Neural">Great! Let me connect you with our sales team for a free quote.</Say>
+    <Dial timeout="25">${FORWARD_TO}</Dial>`;
+  } else if (digit === '2') {
+    response += `<Say voice="Polly.Joanna-Neural">I'll connect you with order tracking.</Say>
+    <Dial timeout="25">${FORWARD_TO}</Dial>`;
+  } else if (digit === '3') {
+    response += `<Say voice="Polly.Joanna-Neural">We're located at 85 May Street in Irvington, New Jersey.</Say>
+    <Gather numDigits="1" action="/voice/menu" method="POST" timeout="8">
+      <Say voice="Polly.Joanna-Neural">Press 1 to speak with someone.</Say>
     </Gather>`;
   } else {
-    response += `<Say voice="Polly.Joanna-Neural">No problem. Press 1 to speak with our team.</Say>`;
-    response += `<Dial>${FORWARD_TO}</Dial>`;
+    // No response - hold for operator
+    response += `<Say voice="Polly.Joanna-Neural">Connecting you now.</Say>
+    <Dial timeout="25">${FORWARD_TO}</Dial>`;
   }
   
   response += `</Response>`;
@@ -78,9 +60,12 @@ app.post('/voice/menu', async (req, res) => {
   res.send(response);
 });
 
-// ============ AI Chat ============
+// ============ AI CHAT ============
 
-async function getAIResponse(message) {
+app.post('/ai/chat', async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+  
   try {
     const response = await axios.post(
       'https://api.minimax.io/v1/chat/completions',
@@ -99,38 +84,23 @@ async function getAIResponse(message) {
       }
     );
     
-    let reply = response.data.choices[0].message.content;
-    // Keep response short for voice
-    if (reply.length > 200) {
-      reply = reply.substring(0, 200);
-    }
-    return reply;
+    const reply = response.data.choices[0].message.content;
+    res.json({ reply: reply.substring(0, 200) });
   } catch (error) {
     console.error('AI Error:', error.message);
-    return "I'd be happy to help you. Press 1 to speak with our team.";
+    res.json({ reply: 'How can I help you today?' });
   }
-}
-
-app.post('/ai/chat', async (req, res) => {
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ error: 'Message required' });
-  
-  const reply = await getAIResponse(message);
-  res.json({ reply });
 });
 
-// ============ Status ============
+// ============ STATUS ============
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', type: 'voice with speech recognition' });
+  res.json({ status: 'ok' });
 });
 
 app.get('/', (req, res) => {
-  res.json({ 
-    service: 'MiniMax Voice Agent',
-    features: ['AI greeting', 'Speech recognition', 'Call forwarding']
-  });
+  res.json({ service: 'Voice Agent', status: 'running' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🎙️ Voice agent running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🎙️ Voice agent ready on port ${PORT}`));
