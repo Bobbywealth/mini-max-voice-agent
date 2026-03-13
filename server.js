@@ -180,7 +180,7 @@ async function getTTS(text) {
       'https://api.minimax.io/v1/t2a',
       {
         text: text,
-        voice_id: 'female-yujia',  // Different voice options: male-shaun-2, female-yujia, male-aigen
+        voice_id: 'male-aigen',  // Trying male-aigen voice
         model: 'speech-01-turbo',
         speed: 1.1,  // Slightly faster
         vol: 1.0
