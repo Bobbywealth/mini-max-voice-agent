@@ -82,7 +82,7 @@ async function getAIResponse(message, phoneNumber = 'default') {
     const response = await minimaxApi.post('/chat/completions', {
       model: 'M2-her',
       messages,
-      max_tokens: 80,
+      max_tokens: 50,
     });
 
     let reply = response.data.choices[0].message.content;
@@ -169,9 +169,9 @@ wss.on('connection', (twilioWs) => {
       sample_rate: 8000,
       channels: 1,
       interim_results: true,
-      utterance_end_ms: 1000,
+      utterance_end_ms: 500,
       vad_events: true,
-      endpointing: 300,
+      endpointing: 200,
 
     });
 
