@@ -106,7 +106,7 @@ async function getAIResponse(message, phoneNumber = 'default') {
 // ============ TWILIO CALL UPDATE (optimized) ============
 async function updateCallWithResponse(callSid, aiResponse) {
   const wsHost = HOST.replace('https://', '');
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Google.en-US-Studio-O">${aiResponse}</Say><Connect><Stream url="wss://${wsHost}/stream" /></Connect></Response>`;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Google.en-US-Chirp3-HD-Zephyr">${aiResponse}</Say><Connect><Stream url="wss://${wsHost}/stream" /></Connect></Response>`;
 
   try {
     await twilioApi.post(`/Calls/${callSid}.json`,
@@ -130,7 +130,7 @@ app.post('/voice/incoming', (req, res) => {
   const wsHost = HOST.replace('https://', '');
   const response = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Studio-O">Hello! Thank you for calling 360 Print Works. How may I help you today?</Say>
+  <Say voice="Google.en-US-Chirp3-HD-Zephyr">Hello! Thank you for calling 360 Print Works. How may I help you today?</Say>
   <Connect>
     <Stream url="wss://${wsHost}/stream" />
   </Connect>
