@@ -11,38 +11,37 @@ app.use(bodyParser.json());
 
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const HOST = process.env.RENDER_EXTERNAL_URL || 'https://mini-max-voice-agent.onrender.com';
 
 const deepgram = createClient(DEEPGRAM_API_KEY);
 
-// MiniMax API instance
 const minimaxApi = axios.create({
   baseURL: 'https://api.minimax.io/v1',
   headers: { 'Authorization': `Bearer ${MINIMAX_API_KEY}`, 'Content-Type': 'application/json' },
   timeout: 8000,
 });
 
-// Short persona for fast responses
-const PERSONA = `You are a friendly receptionist for 360 Print Works, a printing company in New Jersey.
-Be very brief - 1-2 sentences max. Helpful and friendly. No asterisks or action text.`;
+// STRICT: max 15 words, one sentence only
+const PERSONA = `You are a receptionist for 360 Print Works in New Jersey.
+REPLY IN ONE SHORT SENTENCE ONLY. Maximum 12 words. Never use asterisks.`;
 
 const conversationHistory = new Map();
 const activeCalls = new Map();
 
-// ============ KNOWLEDGE BASE ============
 const KNOWLEDGE_BASE = {
-  'business cards': 'Business cards starting at $19.99 for 500.',
-  'brochures': 'Brochures start at $49.99 for 1000 copies.',
-  'flyers': 'Flyers start at $29.99 for 500 copies.',
-  'posters': 'Posters start at $24.99 each. Up to 24x36 inches.',
-  'banners': 'Vinyl banners start at $45.00.',
-  'price': 'Business cards $19.99, flyers $29.99, brochures $49.99.',
+  'business card': 'Business cards start at $19.99 for 500.',
+  'brochure': 'Brochures start at $49.99 for 1000.',
+  'flyer': 'Flyers start at $29.99 for 500.',
+  'poster': 'Posters start at $24.99 each.',
+  'banner': 'Vinyl banners start at $45.',
+  'price': 'Cards $19.99, flyers $29.99, brochures $49.99.',
   'quote': 'What product and quantity do you need?',
-  'discount': '10% off orders over $200, 15% off over $500.',
-  'hours': 'Open Monday through Friday, 8am to 6pm.',
+  'discount': '10% off over $200, 15% off over $500.',
+  'hour': 'Open Monday through Friday, 8am to 6pm.',
   'location': 'We are located in New Jersey.',
+  'get started': 'Tell me what you need to print and I can give you a price.',
+  'hello': 'Hi! What can I help you print today?',
+  'hi': 'Hi! What can I help you print today?',
 };
 
 function searchKnowledgeBase(query) {
@@ -53,13 +52,12 @@ function searchKnowledgeBase(query) {
   return null;
 }
 
-// ============ AI FUNCTION ============
 async function getAIResponse(message, phoneNumber = 'default') {
   const kbAnswer = searchKnowledgeBase(message);
   if (kbAnswer) return kbAnswer;
   try {
     const history = conversationHistory.get(phoneNumber) || [];
-    const recentHistory = history.slice(-6);
+    const recentHistory = history.slice(-4);
     const messages = [
       { role: 'system', content: PERSONA },
       ...recentHistory,
@@ -68,94 +66,103 @@ async function getAIResponse(message, phoneNumber = 'default') {
     const response = await minimaxApi.post('/chat/completions', {
       model: 'M2-her',
       messages,
-      max_tokens: 50,
+      max_tokens: 30,
     });
     let reply = response.data.choices[0].message.content;
-    if (reply.length > 150) reply = reply.substring(0, 150);
+    // Hard truncate at first sentence or 80 chars
+    const sentenceEnd = reply.search(/[.!?]/);
+    if (sentenceEnd > 0) reply = reply.substring(0, sentenceEnd + 1);
+    if (reply.length > 80) reply = reply.substring(0, 80);
     reply = reply.replace(/\*[^*]+\*/g, '').trim();
     const hist = conversationHistory.get(phoneNumber) || [];
     hist.push({ role: 'user', content: message });
     hist.push({ role: 'assistant', content: reply });
-    if (hist.length > 6) hist.splice(0, 2);
+    if (hist.length > 4) hist.splice(0, 2);
     conversationHistory.set(phoneNumber, hist);
     return reply;
   } catch (error) {
     console.error('AI Error:', error.message);
-    return "Sure, how can I help you?";
+    return 'How can I help you today?';
   }
 }
 
-// ============ DEEPGRAM TTS -> MULAW AUDIO ============
-async function textToSpeechMulaw(text) {
-  try {
-    const response = await axios({
+// Streaming TTS: sends audio chunks as they arrive
+async function streamTTSToTwilio(text, twilioWs, streamSid) {
+  return new Promise((resolve) => {
+    const url = 'https://api.deepgram.com/v1/speak?model=aura-2-andromeda-en&encoding=mulaw&sample_rate=8000&container=none';
+    const https = require('https');
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
       method: 'POST',
-      url: 'https://api.deepgram.com/v1/speak?model=aura-2-theia-en&encoding=mulaw&sample_rate=8000&container=none',
       headers: {
         'Authorization': `Token ${DEEPGRAM_API_KEY}`,
         'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(JSON.stringify({ text })),
       },
-      data: JSON.stringify({ text }),
-      responseType: 'arraybuffer',
-      timeout: 5000,
+    };
+    const req = https.request(options, (res) => {
+      let chunkBuffer = Buffer.alloc(0);
+      const CHUNK_SIZE = 3200; // 400ms of audio per send
+      res.on('data', (chunk) => {
+        chunkBuffer = Buffer.concat([chunkBuffer, chunk]);
+        // Send in CHUNK_SIZE pieces as they arrive
+        while (chunkBuffer.length >= CHUNK_SIZE) {
+          const toSend = chunkBuffer.slice(0, CHUNK_SIZE);
+          chunkBuffer = chunkBuffer.slice(CHUNK_SIZE);
+          if (twilioWs.readyState === 1) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload: toSend.toString('base64') }
+            }));
+          }
+        }
+      });
+      res.on('end', () => {
+        // Send remaining audio
+        if (chunkBuffer.length > 0 && twilioWs.readyState === 1) {
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: chunkBuffer.toString('base64') }
+          }));
+        }
+        if (twilioWs.readyState === 1) {
+          twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'audio_done' } }));
+        }
+        resolve();
+      });
+      res.on('error', (err) => {
+        console.error('TTS stream error:', err.message);
+        resolve();
+      });
     });
-    return Buffer.from(response.data);
-  } catch (error) {
-    console.error('TTS Error:', error.message);
-    return null;
-  }
+    req.on('error', (err) => {
+      console.error('TTS request error:', err.message);
+      resolve();
+    });
+    req.write(JSON.stringify({ text }));
+    req.end();
+  });
 }
 
-// ============ SEND AUDIO BACK VIA TWILIO WS ============
-function sendAudioToTwilio(twilioWs, streamSid, audioBuffer) {
-  if (!audioBuffer || !streamSid) return;
-  // Send in 160-byte chunks (20ms of mulaw at 8kHz)
-  const CHUNK_SIZE = 160;
-  for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
-    const chunk = audioBuffer.slice(i, i + CHUNK_SIZE);
-    const msg = JSON.stringify({
-      event: 'media',
-      streamSid: streamSid,
-      media: { payload: chunk.toString('base64') }
-    });
-    if (twilioWs.readyState === 1) {
-      twilioWs.send(msg);
-    }
-  }
-  // Send mark to know when audio finishes
-  if (twilioWs.readyState === 1) {
-    twilioWs.send(JSON.stringify({
-      event: 'mark',
-      streamSid: streamSid,
-      mark: { name: 'audio_done' }
-    }));
-  }
-}
-
-// ============ HTTP SERVER ============
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/stream' });
 
-// ============ VOICE ROUTES ============
 app.post('/voice/incoming', (req, res) => {
   const from = req.body.From || 'unknown';
   console.log('Call from:', from);
   const wsHost = HOST.replace('https://', '');
-  // Use Connect + Stream for bidirectional audio
-  const response = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${wsHost}/stream"><Parameter name="greeting" value="true" /></Stream></Connect></Response>`;
+  const response = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${wsHost}/stream" /></Connect></Response>`;
   res.type('text/xml');
   res.send(response);
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', activeCalls: activeCalls.size });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', activeCalls: activeCalls.size }));
+app.get('/', (req, res) => res.json({ service: 'Voice Agent v4 - Streaming TTS', version: '4.0' }));
 
-app.get('/', (req, res) => {
-  res.json({ service: 'Voice Agent - Bidirectional', version: '3.0' });
-});
-
-// ============ WEBSOCKET: BIDIRECTIONAL STREAMING ============
 wss.on('connection', (twilioWs) => {
   console.log('Twilio Media Stream connected');
   let callSid = null;
@@ -165,18 +172,14 @@ wss.on('connection', (twilioWs) => {
   let isProcessing = false;
   let isSpeaking = false;
 
-  // Send greeting audio when stream starts
   async function sendGreeting() {
-    const greetingText = 'Hello! Thank you for calling 360 Print Works. How may I help you today?';
-    console.log('Sending greeting via TTS');
-    const audio = await textToSpeechMulaw(greetingText);
-    if (audio) {
-      sendAudioToTwilio(twilioWs, streamSid, audio);
-      console.log('Greeting audio sent');
-    }
+    const text = 'Thanks for calling 360 Print Works. How can I help you?';
+    console.log('Sending greeting');
+    isSpeaking = true;
+    await streamTTSToTwilio(text, twilioWs, streamSid);
+    console.log('Greeting sent');
   }
 
-  // Connect to Deepgram STT
   function connectDeepgram() {
     dgConnection = deepgram.listen.live({
       model: 'nova-3',
@@ -186,14 +189,12 @@ wss.on('connection', (twilioWs) => {
       sample_rate: 8000,
       channels: 1,
       interim_results: true,
-      utterance_end_ms: 1000,
+      utterance_end_ms: 800,
       vad_events: true,
-      endpointing: 300,
+      endpointing: 200,
     });
 
-    dgConnection.on(LiveTranscriptionEvents.Open, () => {
-      console.log('Deepgram connected');
-    });
+    dgConnection.on(LiveTranscriptionEvents.Open, () => console.log('Deepgram connected'));
 
     dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
       const transcript = data.channel?.alternatives?.[0]?.transcript;
@@ -201,7 +202,6 @@ wss.on('connection', (twilioWs) => {
       if (data.is_final) {
         transcriptBuffer += ' ' + transcript;
         console.log('STT:', transcript);
-        // If AI is speaking and user talks, clear the audio (barge-in)
         if (isSpeaking && streamSid && twilioWs.readyState === 1) {
           twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
           isSpeaking = false;
@@ -218,36 +218,26 @@ wss.on('connection', (twilioWs) => {
       isProcessing = true;
       const startTime = Date.now();
       try {
-        // Get AI response
         const aiReply = await getAIResponse(fullText, callSid || 'unknown');
         const aiTime = Date.now() - startTime;
         console.log(`AI reply (${aiTime}ms):`, aiReply);
-        // Convert to audio and send back through websocket
-        const audio = await textToSpeechMulaw(aiReply);
-        const totalTime = Date.now() - startTime;
-        if (audio && streamSid) {
+        if (streamSid) {
           isSpeaking = true;
-          sendAudioToTwilio(twilioWs, streamSid, audio);
-          console.log(`Total response time: ${totalTime}ms (AI: ${aiTime}ms, TTS: ${totalTime - aiTime}ms)`);
+          await streamTTSToTwilio(aiReply, twilioWs, streamSid);
+          console.log(`Total response time: ${Date.now() - startTime}ms (AI: ${aiTime}ms)`);
         }
       } catch (err) {
         console.error('Error:', err.message);
       } finally {
         isProcessing = false;
+        isSpeaking = false;
       }
     });
 
-    dgConnection.on(LiveTranscriptionEvents.Error, (error) => {
-      console.error('Deepgram error:', error);
-    });
+    dgConnection.on(LiveTranscriptionEvents.Error, (e) => console.error('Deepgram error:', e));
+    dgConnection.on(LiveTranscriptionEvents.Close, () => console.log('Deepgram closed'));
 
-    dgConnection.on(LiveTranscriptionEvents.Close, () => {
-      console.log('Deepgram closed');
-    });
-
-    const keepAlive = setInterval(() => {
-      if (dgConnection) dgConnection.keepAlive();
-    }, 8000);
+    const keepAlive = setInterval(() => { if (dgConnection) dgConnection.keepAlive(); }, 8000);
     dgConnection._keepAliveInterval = keepAlive;
   }
 
@@ -262,7 +252,6 @@ wss.on('connection', (twilioWs) => {
           streamSid = data.start.streamSid;
           console.log('Stream started - Call:', callSid);
           activeCalls.set(callSid, { streamSid, startTime: Date.now() });
-          // Send greeting after stream starts
           sendGreeting();
           break;
         case 'media':
@@ -271,9 +260,7 @@ wss.on('connection', (twilioWs) => {
           }
           break;
         case 'mark':
-          if (data.mark?.name === 'audio_done') {
-            isSpeaking = false;
-          }
+          if (data.mark?.name === 'audio_done') isSpeaking = false;
           break;
         case 'stop':
           console.log('Stream stopped');
@@ -294,10 +281,8 @@ wss.on('connection', (twilioWs) => {
     if (callSid) activeCalls.delete(callSid);
   });
 
-  twilioWs.on('error', (err) => {
-    console.error('WS error:', err.message);
-  });
+  twilioWs.on('error', (err) => console.error('WS error:', err.message));
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Voice Agent v3 ready on port ${PORT}`));
+server.listen(PORT, () => console.log(`Voice Agent v4 ready on port ${PORT}`));
