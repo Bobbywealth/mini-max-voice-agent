@@ -168,11 +168,11 @@ wss.on('connection', (twilioWs) => {
       encoding: 'mulaw',
       sample_rate: 8000,
       channels: 1,
-      interim_results: false,
+      interim_results: true,
       utterance_end_ms: 1000,
       vad_events: true,
       endpointing: 300,
-      no_delay: true,
+
     });
 
     dgConnection.on(LiveTranscriptionEvents.Open, () => {
