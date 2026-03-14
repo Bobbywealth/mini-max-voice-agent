@@ -92,19 +92,9 @@ wss.on('connection', (ws) => {
         const reply = await getAIResponse(transcript);
         console.log(`🤖 AI: ${reply}`);
         
-        // Get TTS audio
-        const audioBase64 = await getTTS(reply);
-        
-        if (audioBase64) {
-          // Send audio back to Twilio
-          ws.send(JSON.stringify({
-            event: 'media',
-            media: {
-              payload: audioBase64
-            }
-          }));
-          console.log(`📢 Playing: ${reply}`);
-        }
+        // Use streaming TTS for lower latency
+        await streamTTS(reply, ws);
+        console.log(`📢 Playing: ${reply}`);
       }
     });
     
@@ -173,16 +163,71 @@ async function getAIResponse(message) {
   }
 }
 
-async function getTTS(text) {
+// Streaming TTS - sends chunks as they arrive for lower latency
+async function streamTTS(text, ws) {
   try {
-    // Use MiniMax TTS - optimized for low latency
     const response = await axios.post(
       'https://api.minimax.io/v1/t2a',
       {
         text: text,
-        voice_id: 'English_Upbeat_Woman',  // Updated to English_Upbeat_Woman
+        voice_id: 'English_Upbeat_Woman',
         model: 'speech-01-turbo',
-        speed: 1.1,  // Slightly faster
+        speed: 1.1,
+        stream: true
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${MINIMAX_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'stream'
+      }
+    );
+
+    return new Promise((resolve, reject) => {
+      let audioBuffer = Buffer.alloc(0);
+      
+      response.data.on('data', (chunk) => {
+        audioBuffer = Buffer.concat([audioBuffer, chunk]);
+        
+        // Send chunks to Twilio as they arrive (in base64)
+        const chunkBase64 = chunk.toString('base64');
+        if (chunkBase64.length > 0) {
+          ws.send(JSON.stringify({
+            event: 'media',
+            media: {
+              payload: chunkBase64
+            }
+          }));
+        }
+      });
+      
+      response.data.on('end', () => {
+        console.log(`📢 Streaming complete: ${text}`);
+        resolve(audioBuffer.toString('base64'));
+      });
+      
+      response.data.on('error', (err) => {
+        console.error('TTS Stream error:', err.message);
+        reject(err);
+      });
+    });
+  } catch (error) {
+    console.error('TTS Error:', error.message);
+    return null;
+  }
+}
+
+// Original getTTS (kept for compatibility)
+async function getTTS(text) {
+  try {
+    const response = await axios.post(
+      'https://api.minimax.io/v1/t2a',
+      {
+        text: text,
+        voice_id: 'English_Upbeat_Woman',
+        model: 'speech-01-turbo',
+        speed: 1.1,
         vol: 1.0
       },
       {
