@@ -9,36 +9,25 @@ require('dotenv').config();
 const app = express();
 app.use(bodyParser.json());
 
-const FORWARD_TO = process.env.FORWARD_TO || '+18089139158';
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const HOST = process.env.RENDER_EXTERNAL_URL || 'https://mini-max-voice-agent.onrender.com';
 
-// Pre-create Deepgram client once
 const deepgram = createClient(DEEPGRAM_API_KEY);
 
-// Pre-create axios instance with keep-alive for Twilio API
-const twilioApi = axios.create({
-  baseURL: `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}`,
-  auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
-  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  timeout: 5000,
-});
-
-// Pre-create axios instance for MiniMax with timeout
+// MiniMax API instance
 const minimaxApi = axios.create({
   baseURL: 'https://api.minimax.io/v1',
   headers: { 'Authorization': `Bearer ${MINIMAX_API_KEY}`, 'Content-Type': 'application/json' },
   timeout: 8000,
 });
 
-// AI Persona - keep short to reduce token processing
+// Short persona for fast responses
 const PERSONA = `You are a friendly receptionist for 360 Print Works, a printing company in New Jersey.
 Be very brief - 1-2 sentences max. Helpful and friendly. No asterisks or action text.`;
 
-// Conversation history store
 const conversationHistory = new Map();
 const activeCalls = new Map();
 
@@ -64,38 +53,31 @@ function searchKnowledgeBase(query) {
   return null;
 }
 
-// ============ AI FUNCTION (optimized) ============
+// ============ AI FUNCTION ============
 async function getAIResponse(message, phoneNumber = 'default') {
   const kbAnswer = searchKnowledgeBase(message);
-  if (kbAnswer) return kbAnswer; // Fast path: skip AI if KB has answer
-
+  if (kbAnswer) return kbAnswer;
   try {
     const history = conversationHistory.get(phoneNumber) || [];
-    // Only send last 3 exchanges to reduce tokens
     const recentHistory = history.slice(-6);
     const messages = [
       { role: 'system', content: PERSONA },
       ...recentHistory,
       { role: 'user', content: message }
     ];
-
     const response = await minimaxApi.post('/chat/completions', {
       model: 'M2-her',
       messages,
       max_tokens: 50,
     });
-
     let reply = response.data.choices[0].message.content;
     if (reply.length > 150) reply = reply.substring(0, 150);
     reply = reply.replace(/\*[^*]+\*/g, '').trim();
-
-    // Save history
     const hist = conversationHistory.get(phoneNumber) || [];
     hist.push({ role: 'user', content: message });
     hist.push({ role: 'assistant', content: reply });
     if (hist.length > 6) hist.splice(0, 2);
     conversationHistory.set(phoneNumber, hist);
-
     return reply;
   } catch (error) {
     console.error('AI Error:', error.message);
@@ -103,18 +85,50 @@ async function getAIResponse(message, phoneNumber = 'default') {
   }
 }
 
-// ============ TWILIO CALL UPDATE (optimized) ============
-async function updateCallWithResponse(callSid, aiResponse) {
-  const wsHost = HOST.replace('https://', '');
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Google.en-US-Chirp3-HD-Zephyr">${aiResponse}</Say><Connect><Stream url="wss://${wsHost}/stream" /></Connect></Response>`;
-
+// ============ DEEPGRAM TTS -> MULAW AUDIO ============
+async function textToSpeechMulaw(text) {
   try {
-    await twilioApi.post(`/Calls/${callSid}.json`,
-      new URLSearchParams({ Twiml: twiml }).toString()
-    );
-    console.log('Call updated with AI response');
+    const response = await axios({
+      method: 'POST',
+      url: 'https://api.deepgram.com/v1/speak?model=aura-2-theia-en&encoding=mulaw&sample_rate=8000&container=none',
+      headers: {
+        'Authorization': `Token ${DEEPGRAM_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      data: JSON.stringify({ text }),
+      responseType: 'arraybuffer',
+      timeout: 5000,
+    });
+    return Buffer.from(response.data);
   } catch (error) {
-    console.error('Failed to update call:', error.message);
+    console.error('TTS Error:', error.message);
+    return null;
+  }
+}
+
+// ============ SEND AUDIO BACK VIA TWILIO WS ============
+function sendAudioToTwilio(twilioWs, streamSid, audioBuffer) {
+  if (!audioBuffer || !streamSid) return;
+  // Send in 160-byte chunks (20ms of mulaw at 8kHz)
+  const CHUNK_SIZE = 160;
+  for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+    const chunk = audioBuffer.slice(i, i + CHUNK_SIZE);
+    const msg = JSON.stringify({
+      event: 'media',
+      streamSid: streamSid,
+      media: { payload: chunk.toString('base64') }
+    });
+    if (twilioWs.readyState === 1) {
+      twilioWs.send(msg);
+    }
+  }
+  // Send mark to know when audio finishes
+  if (twilioWs.readyState === 1) {
+    twilioWs.send(JSON.stringify({
+      event: 'mark',
+      streamSid: streamSid,
+      mark: { name: 'audio_done' }
+    }));
   }
 }
 
@@ -126,16 +140,9 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 app.post('/voice/incoming', (req, res) => {
   const from = req.body.From || 'unknown';
   console.log('Call from:', from);
-
   const wsHost = HOST.replace('https://', '');
-  const response = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Google.en-US-Chirp3-HD-Zephyr">Hello! Thank you for calling 360 Print Works. How may I help you today?</Say>
-  <Connect>
-    <Stream url="wss://${wsHost}/stream" />
-  </Connect>
-</Response>`;
-
+  // Use Connect + Stream for bidirectional audio
+  const response = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${wsHost}/stream"><Parameter name="greeting" value="true" /></Stream></Connect></Response>`;
   res.type('text/xml');
   res.send(response);
 });
@@ -145,21 +152,31 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Voice Agent - Low Latency', version: '2.0' });
+  res.json({ service: 'Voice Agent - Bidirectional', version: '3.0' });
 });
 
-// ============ WEBSOCKET: TWILIO STREAM -> DEEPGRAM STT ============
+// ============ WEBSOCKET: BIDIRECTIONAL STREAMING ============
 wss.on('connection', (twilioWs) => {
   console.log('Twilio Media Stream connected');
-
   let callSid = null;
   let streamSid = null;
   let dgConnection = null;
   let transcriptBuffer = '';
   let isProcessing = false;
-  let lastTranscriptTime = 0;
+  let isSpeaking = false;
 
-  // Connect to Deepgram live STT with low-latency settings
+  // Send greeting audio when stream starts
+  async function sendGreeting() {
+    const greetingText = 'Hello! Thank you for calling 360 Print Works. How may I help you today?';
+    console.log('Sending greeting via TTS');
+    const audio = await textToSpeechMulaw(greetingText);
+    if (audio) {
+      sendAudioToTwilio(twilioWs, streamSid, audio);
+      console.log('Greeting audio sent');
+    }
+  }
+
+  // Connect to Deepgram STT
   function connectDeepgram() {
     dgConnection = deepgram.listen.live({
       model: 'nova-3',
@@ -172,7 +189,6 @@ wss.on('connection', (twilioWs) => {
       utterance_end_ms: 1000,
       vad_events: true,
       endpointing: 300,
-
     });
 
     dgConnection.on(LiveTranscriptionEvents.Open, () => {
@@ -182,30 +198,37 @@ wss.on('connection', (twilioWs) => {
     dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
       const transcript = data.channel?.alternatives?.[0]?.transcript;
       if (!transcript || transcript.trim() === '') return;
-
       if (data.is_final) {
         transcriptBuffer += ' ' + transcript;
-        lastTranscriptTime = Date.now();
         console.log('STT:', transcript);
+        // If AI is speaking and user talks, clear the audio (barge-in)
+        if (isSpeaking && streamSid && twilioWs.readyState === 1) {
+          twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
+          isSpeaking = false;
+          console.log('Barge-in: cleared audio');
+        }
       }
     });
 
     dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
       const fullText = transcriptBuffer.trim();
       if (!fullText || isProcessing) return;
-
       console.log('User said:', fullText);
       transcriptBuffer = '';
       isProcessing = true;
-
       const startTime = Date.now();
       try {
+        // Get AI response
         const aiReply = await getAIResponse(fullText, callSid || 'unknown');
-        console.log(`AI reply (${Date.now() - startTime}ms):`, aiReply);
-
-        if (callSid) {
-          await updateCallWithResponse(callSid, aiReply);
-          console.log(`Total response time: ${Date.now() - startTime}ms`);
+        const aiTime = Date.now() - startTime;
+        console.log(`AI reply (${aiTime}ms):`, aiReply);
+        // Convert to audio and send back through websocket
+        const audio = await textToSpeechMulaw(aiReply);
+        const totalTime = Date.now() - startTime;
+        if (audio && streamSid) {
+          isSpeaking = true;
+          sendAudioToTwilio(twilioWs, streamSid, audio);
+          console.log(`Total response time: ${totalTime}ms (AI: ${aiTime}ms, TTS: ${totalTime - aiTime}ms)`);
         }
       } catch (err) {
         console.error('Error:', err.message);
@@ -222,7 +245,6 @@ wss.on('connection', (twilioWs) => {
       console.log('Deepgram closed');
     });
 
-    // Keep alive every 8s
     const keepAlive = setInterval(() => {
       if (dgConnection) dgConnection.keepAlive();
     }, 8000);
@@ -240,10 +262,17 @@ wss.on('connection', (twilioWs) => {
           streamSid = data.start.streamSid;
           console.log('Stream started - Call:', callSid);
           activeCalls.set(callSid, { streamSid, startTime: Date.now() });
+          // Send greeting after stream starts
+          sendGreeting();
           break;
         case 'media':
           if (dgConnection && dgConnection.getReadyState() === 1) {
             dgConnection.send(Buffer.from(data.media.payload, 'base64'));
+          }
+          break;
+        case 'mark':
+          if (data.mark?.name === 'audio_done') {
+            isSpeaking = false;
           }
           break;
         case 'stop':
@@ -271,4 +300,4 @@ wss.on('connection', (twilioWs) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Voice Agent ready on port ${PORT}`));
+server.listen(PORT, () => console.log(`Voice Agent v3 ready on port ${PORT}`));
